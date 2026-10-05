@@ -1,5 +1,5 @@
 #!/bin/sh
-# Install Corpus from GitHub Releases. Usage: sh install.sh [version]
+# Install Corpus from GitHub Releases. Usage: sh install.sh [version|--channel stable|beta]
 # Keep execution inside main so a truncated curl | sh download cannot install.
 
 fail() {
@@ -72,12 +72,29 @@ EOF
 
 main() {
     set -eu
-    [ "$#" -le 1 ] || fail 'Usage: sh install.sh [version]'
-    case "${1:-}" in
-        -h|--help)
-            printf 'Usage: sh install.sh [version]\nOmit version for the latest stable release. A v prefix is optional.\n'
-            return
+    channel=stable
+    requested_version=''
+    case "$#" in
+        0) ;;
+        1)
+            case "$1" in
+                -h|--help)
+                    printf 'Usage: sh install.sh [version|--channel stable|beta]\nDefault channel: stable. Beta selects published GitHub prereleases.\nA v prefix is optional when specifying a version.\n'
+                    return
+                    ;;
+                -*) fail 'Usage: sh install.sh [version|--channel stable|beta]' ;;
+                *) requested_version=${1#v} ;;
+            esac
             ;;
+        2)
+            [ "$1" = --channel ] || fail 'Usage: sh install.sh [version|--channel stable|beta]'
+            channel=$2
+            ;;
+        *) fail 'Usage: sh install.sh [version|--channel stable|beta]' ;;
+    esac
+    case "$channel" in
+        stable|beta) ;;
+        *) fail "Unknown channel: $channel (expected stable or beta)." ;;
     esac
     [ -n "${HOME:-}" ] || fail 'HOME must be set.'
     case "$HOME" in /*) ;; *) fail 'HOME must be an absolute path.' ;; esac
@@ -103,13 +120,67 @@ main() {
 
     repository=https://github.com/fuxingloh/corpus
     if [ "$#" -eq 1 ]; then
-        version=${1#v}
+        version=$requested_version
+    elif [ "$channel" = beta ]; then
+        page=1
+        while :; do
+            releases=$(download --header 'Accept: application/vnd.github+json' \
+                "https://api.github.com/repos/fuxingloh/corpus/releases?per_page=100&page=$page") \
+                || fail 'Could not resolve the beta channel.'
+            # Split GitHub release objects while respecting strings and nested objects.
+            # Select a published prerelease, or return the page size for pagination.
+            selection=$(printf '%s\n' "$releases" | awk '
+                {
+                    for (i = 1; i <= length($0); i++) {
+                        c = substr($0, i, 1)
+                        if (depth > 0) object = object c
+                        if (quoted) {
+                            if (escaped) escaped = 0
+                            else if (c == "\\") escaped = 1
+                            else if (c == "\"") quoted = 0
+                            continue
+                        }
+                        if (c == "\"") quoted = 1
+                        else if (c == "{") {
+                            if (depth == 0) object = c
+                            depth++
+                        } else if (c == "}") {
+                            depth--
+                            if (depth == 0) {
+                                count++
+                                if (object ~ /"draft"[[:space:]]*:[[:space:]]*false/ &&
+                                    object ~ /"prerelease"[[:space:]]*:[[:space:]]*true/ &&
+                                    match(object, /"tag_name"[[:space:]]*:[[:space:]]*"[^"\\]*"/)) {
+                                    tag = substr(object, RSTART, RLENGTH)
+                                    sub(/^"tag_name"[[:space:]]*:[[:space:]]*"/, "", tag)
+                                    sub(/"$/, "", tag)
+                                    print tag
+                                    found = 1
+                                    exit
+                                }
+                            }
+                        }
+                    }
+                    if (depth > 0) object = object "\n"
+                }
+                END { if (!found) print count + 0 }
+            ')
+            case "$selection" in
+                v*) version=${selection#v}; break ;;
+                100) page=$((page + 1)) ;;
+                *[!0-9]*) fail "Unexpected beta release tag: $selection (expected v<version>)." ;;
+                *) fail "No published beta release is available at $repository/releases." ;;
+            esac
+        done
     else
         # GitHub's latest-release redirect excludes drafts and prereleases.
         release_url=$(download --output /dev/null --write-out '%{url_effective}' \
             "$repository/releases/latest") || fail 'Could not resolve the latest stable release.'
         case "$release_url" in
             "$repository/releases/tag/v"*) version=${release_url##*/v} ;;
+            "$repository/releases"|"$repository/releases/")
+                fail "No published stable release is available. Use --channel beta for prereleases, or specify a version. See $repository/releases."
+                ;;
             *) fail "Unexpected latest-release URL: $release_url" ;;
         esac
     fi
